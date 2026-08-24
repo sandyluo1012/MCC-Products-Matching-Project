@@ -772,13 +772,23 @@ def recommend(
         return pd.DataFrame()
     results = pd.DataFrame(result_rows)
 
-    leading = [
-        "Product", "Manufacture", "综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分", "已比较参数",
-        "可信度", "关键参数检查", "关键参数问题", "缺失参数", "风险提示", "核对提示", "车规等级",
-        "Package Type", *categorical,
+    summary_columns = [
+        "Product", "Manufacture", "综合得分", "已知参数匹配度", "参数覆盖率",
+        "方向偏好得分", "已比较参数", "可信度", "关键参数检查", "车规等级",
     ]
-    columns = [column for column in leading if column in results]
-    columns += [column for column in active if column not in columns]
+    # 推荐表必须携带候选的全部可匹配参数，而不是只返回 query 已填写的 active 参数。
+    # 这样 GUI 无论普通/精简模式都能查看候选的完整规格。
+    candidate_parameter_columns = ["Package Type", *categorical, *numeric]
+    diagnostic_columns = ["关键参数问题", "缺失参数", "风险提示", "核对提示"]
+    columns = [column for column in summary_columns if column in results]
+    columns += [
+        column for column in candidate_parameter_columns
+        if column in results and column not in columns
+    ]
+    columns += [
+        column for column in diagnostic_columns
+        if column in results and column not in columns
+    ]
     return (
         results.sort_values(["_规则等级", "综合得分", "参数覆盖率", "已知参数匹配度"], ascending=False)
         .head(top_k)[columns]

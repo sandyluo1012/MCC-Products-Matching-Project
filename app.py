@@ -77,11 +77,39 @@ DEEPSEEK_MANUFACTURERS = (
 )
 
 COMPACT_RESULT_LEADING_COLUMNS = (
-    "Product", "Manufacture", "综合得分", "已知参数匹配度", "参数覆盖率",
-    "可信度", "关键参数检查", "车规等级", "Package Type",
-    "Number of Functions", "Configuration", "Polarity", "Channel", "ESD Diodes",
+    "Product", "Manufacture", "综合得分", "可信度", "关键参数检查", "车规等级",
 )
 COMPACT_RESULT_TRAILING_COLUMNS = ("关键参数问题", "缺失参数", "风险提示")
+NON_CANDIDATE_RESULT_COLUMNS = {
+    "综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分", "已比较参数",
+    "可信度", "关键参数检查", "关键参数问题", "缺失参数", "风险提示", "核对提示",
+    "车规等级",
+}
+
+RESULT_COLUMN_WIDTHS = {
+    "Product": 180,
+    "Manufacture": 90,
+    "综合得分": 90,
+    "已知参数匹配度": 120,
+    "参数覆盖率": 105,
+    "方向偏好得分": 115,
+    "可信度": 75,
+    "关键参数检查": 110,
+    "车规等级": 85,
+    "Package Type": 120,
+    "Number of Functions": 135,
+    "Configuration": 130,
+    "Polarity": 90,
+    "Channel": 85,
+    "ESD Diodes": 95,
+    "关键参数问题": 150,
+    "缺失参数": 130,
+    "风险提示": 170,
+    "核对提示": 170,
+}
+RESULT_LEFT_ALIGNED_COLUMNS = {
+    "Product", "Manufacture", "关键参数问题", "缺失参数", "风险提示", "核对提示",
+}
 
 
 def _localized_catalogs(catalogs: dict[str, Path]) -> dict[str, Path]:
@@ -226,6 +254,18 @@ def _same_manufacturer(first: Any, second: Any) -> bool:
     return bool(first_key and first_key == _manufacturer_key(second))
 
 
+def _result_column_width(column: str) -> int:
+    """返回稳定的结果表列宽；长说明列不得挤压前方关键列。"""
+    return RESULT_COLUMN_WIDTHS.get(column, 135)
+
+
+def _gui_manufacturer(value: Any) -> Any:
+    """仅在 GUI 表格中缩写 MCC，模型结果和导出数据保持原值。"""
+    if _manufacturer_key(value) == "microcommercialcomponents":
+        return "MCC"
+    return value
+
+
 def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -250,7 +290,7 @@ def build_result_view(
     *,
     compact: bool = False,
     automotive_only: bool = False,
-    critical_columns: set[str] | None = None,
+    candidate_columns: list[str] | tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """根据 GUI 视图选项筛选行和列，不修改模型生成的完整结果。"""
     view = results
@@ -266,9 +306,13 @@ def build_result_view(
         column for column in COMPACT_RESULT_LEADING_COLUMNS
         if column in view.columns
     ]
-    ordered.extend(
+    parameter_columns = candidate_columns if candidate_columns is not None else [
         column for column in view.columns
-        if column in (critical_columns or set()) and column not in ordered
+        if column not in NON_CANDIDATE_RESULT_COLUMNS
+    ]
+    ordered.extend(
+        column for column in parameter_columns
+        if column in view.columns and column not in ordered
     )
     ordered.extend(
         column for column in COMPACT_RESULT_TRAILING_COLUMNS
@@ -300,7 +344,9 @@ class MatchingApp(tk.Tk):
         self.previous_pair_selector_value = ""
         self.results = pd.DataFrame()
         self.has_run_match = False
-        self.critical_result_columns: set[str] = set()
+        self.candidate_parameter_columns: list[str] = []
+        self._syncing_result_scroll = False
+        self._syncing_result_selection = False
         self.compact_results_var = tk.BooleanVar(value=False)
         self.automotive_only_var = tk.BooleanVar(value=False)
         self.deepseek_api_key_var = tk.StringVar(
@@ -375,10 +421,11 @@ class MatchingApp(tk.Tk):
         ).pack(side="left", padx=(8, 0))
         ttk.Label(
             customer,
-            text="本程序不将 Key 写入磁盘；仅在本次运行中使用并经 HTTPS 发送给 DeepSeek。",
+            # text="使用DeepSeek查询物料号并自动填入参数",
             style="Sub.TLabel",
             wraplength=330,
-        ).pack(anchor="w", pady=(3, 7))
+        # ).pack(anchor="w", pady=(3, 7))
+        ).pack(anchor='w')
 
         ttk.Label(customer, text="制造商（可选）").pack(anchor="w")
         self.manufacturer_box = ttk.Combobox(
@@ -391,7 +438,7 @@ class MatchingApp(tk.Tk):
         self.manufacturer_box.bind("<<ComboboxSelected>>", self._manufacturer_edited)
         ttk.Label(
             customer,
-            text="通常不需要选择；只有 DeepSeek 发现同型号重名/有歧义时再选。",
+            text="通常不需要选择; 只有DeepSeek发现同型号重名时再选。",
             style="Sub.TLabel",
             wraplength=330,
         ).pack(anchor="w", pady=(3, 7))
@@ -449,19 +496,100 @@ class MatchingApp(tk.Tk):
         ttk.Label(action, textvariable=self.status_var, style="Sub.TLabel").pack(side="right")
         table_frame = ttk.Frame(right)
         table_frame.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(table_frame, show="headings")
-        ybar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        # 用固定宽度容器统一 Product 列与冻结分隔线的位置。Treeview 的主题边框
+        # 会额外占用像素，不能直接把“列宽”当作整个冻结区域的控件宽度。
+        self.product_pane = ttk.Frame(
+            table_frame, width=RESULT_COLUMN_WIDTHS["Product"],
+        )
+        # 子控件使用 pack，因此必须关闭 pack 的尺寸传播；否则 Treeview 的主题
+        # 边框仍会把 180 px 容器撑成 182 px。
+        self.product_pane.pack_propagate(False)
+        self.product_tree = ttk.Treeview(
+            self.product_pane, show="headings", selectmode="browse", height=10,
+        )
+        self.product_tree.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            table_frame, show="headings", selectmode="browse", height=10,
+        )
+        ybar = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self._scroll_result_trees,
+        )
+        self.result_ybar = ybar
         xbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
-        self.tree.tag_configure("passed", background="#edf8ef", foreground="#205c2e")
-        self.tree.tag_configure("pending", background="#fff7df", foreground="#765b00")
-        self.tree.tag_configure("failed", background="#ffe9e9", foreground="#8a2020")
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        ybar.grid(row=0, column=1, sticky="ns")
-        xbar.grid(row=1, column=0, sticky="ew")
+        self.product_tree.configure(
+            yscrollcommand=lambda first, last: self._result_yview_changed(
+                self.product_tree, first, last
+            )
+        )
+        self.tree.configure(
+            yscrollcommand=lambda first, last: self._result_yview_changed(
+                self.tree, first, last
+            ),
+            xscrollcommand=xbar.set,
+        )
+        for result_tree in (self.product_tree, self.tree):
+            result_tree.tag_configure("passed", background="#edf8ef", foreground="#205c2e")
+            result_tree.tag_configure("pending", background="#fff7df", foreground="#765b00")
+            result_tree.tag_configure("failed", background="#ffe9e9", foreground="#8a2020")
+            result_tree.bind("<<TreeviewSelect>>", self._sync_result_selection)
+        self.product_pane.grid(row=0, column=0, sticky="ns")
+        self.tree.grid(row=0, column=1, sticky="nsew")
+        ybar.grid(row=0, column=2, sticky="ns")
+        xbar.grid(row=1, column=1, sticky="ew")
         table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=0)
+        table_frame.columnconfigure(1, weight=1)
         self._bind_customer_mousewheel(self.customer_panel)
+
+    def _scroll_result_trees(self, *args: str) -> None:
+        """让固定 Product 列和右侧参数表共享同一根垂直滚动条。"""
+        self._syncing_result_scroll = True
+        try:
+            self.product_tree.yview(*args)
+            self.tree.yview(*args)
+        finally:
+            self._syncing_result_scroll = False
+
+    def _result_yview_changed(
+        self,
+        source: ttk.Treeview,
+        first: str,
+        last: str,
+    ) -> None:
+        """鼠标滚轮或键盘滚动任意一侧时同步另一侧。"""
+        self.result_ybar.set(first, last)
+        if self._syncing_result_scroll:
+            return
+        target = self.tree if source is self.product_tree else self.product_tree
+        target_view = target.yview()
+        if target_view and abs(float(target_view[0]) - float(first)) < 1e-9:
+            return
+        self._syncing_result_scroll = True
+        try:
+            target.yview_moveto(first)
+        finally:
+            self._syncing_result_scroll = False
+
+    def _sync_result_selection(self, event: tk.Event) -> None:
+        """选择固定列或参数区的某一行时，高亮另一侧同一物料。"""
+        if self._syncing_result_selection:
+            return
+        source = event.widget
+        target = self.tree if source is self.product_tree else self.product_tree
+        selection = source.selection()
+        target_selection = target.selection()
+        if target_selection == selection:
+            return
+        self._syncing_result_selection = True
+        try:
+            if target_selection:
+                target.selection_remove(*target_selection)
+            if selection:
+                target.selection_set(*selection)
+                target.focus(selection[0])
+                target.see(selection[0])
+        finally:
+            self._syncing_result_selection = False
 
     def _toggle_api_key_visibility(self) -> None:
         """只切换输入框的本地显示方式，不复制、记录或持久化 Key。"""
@@ -546,7 +674,6 @@ class MatchingApp(tk.Tk):
         self.numeric_input_columns = set(numeric)
         self.categorical_input_columns = {"Package Type", *categorical}
         critical = critical_features(self.df)
-        self.critical_result_columns = critical
         preferred = preference_features(self.df)
         paired = paired_features(self.df)
         if paired and "Polarity" in self.df.columns and any(
@@ -566,6 +693,7 @@ class MatchingApp(tk.Tk):
             self.pair_second_single_values = {"p", "p+p"}
         plus_minus = plus_minus_features(self.df)
         fields = ["Package Type", *categorical, *numeric]
+        self.candidate_parameter_columns = fields.copy()
         for index, column in enumerate(fields):
             is_esd_discharge = _is_esd_discharge_field(column)
             if column == "Package Type":
@@ -1221,7 +1349,7 @@ class MatchingApp(tk.Tk):
         display = build_result_view(
             filtered,
             compact=self.compact_results_var.get(),
-            critical_columns=self.critical_result_columns,
+            candidate_columns=self.candidate_parameter_columns,
         )
         self._show(display)
         if not self.has_run_match:
@@ -1244,19 +1372,36 @@ class MatchingApp(tk.Tk):
             )
 
     def _show(self, data: pd.DataFrame) -> None:
+        self.product_tree.delete(*self.product_tree.get_children())
         self.tree.delete(*self.tree.get_children())
-        self.tree["columns"] = list(data.columns)
-        for column in data.columns:
+        self.product_tree["columns"] = ["Product"]
+        self.product_tree.heading("Product", text="Product")
+        self.product_tree.column(
+            "Product",
+            width=_result_column_width("Product"),
+            minwidth=100,
+            anchor="w",
+            # 固定容器决定冻结区域宽度，唯一一列始终填满内部空间，避免右侧留白。
+            stretch=True,
+        )
+        scrollable_columns = [column for column in data.columns if column != "Product"]
+        self.tree["columns"] = scrollable_columns
+        for column in scrollable_columns:
             self.tree.heading(column, text=column)
-            if column in {"关键参数问题", "缺失参数", "风险提示", "核对提示"}:
-                width = 300
-            else:
-                width = 145 if column != "Product" else 170
-            self.tree.column(column, width=width, anchor="center")
-        for _, row in data.iterrows():
+            self.tree.column(
+                column,
+                width=_result_column_width(column),
+                minwidth=60,
+                anchor="w" if column in RESULT_LEFT_ALIGNED_COLUMNS else "center",
+                stretch=False,
+            )
+        for position, (_, row) in enumerate(data.iterrows()):
             values = []
-            for col, value in row.items():
-                if col in {"综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分"}:
+            for col in scrollable_columns:
+                value = row.get(col)
+                if col == "Manufacture":
+                    values.append("" if pd.isna(value) else _gui_manufacturer(value))
+                elif col in {"综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分"}:
                     values.append(f"{float(value):.1f}%")
                 elif isinstance(value, float):
                     values.append("" if pd.isna(value) else f"{value:g}")
@@ -1264,8 +1409,14 @@ class MatchingApp(tk.Tk):
                     values.append("" if pd.isna(value) else value)
             status = str(row.get("关键参数检查", ""))
             tag = {"通过": "passed", "待人工确认": "pending", "不满足": "failed"}.get(status, "")
-            self.tree.insert("", "end", values=values, tags=(tag,) if tag else ())
+            iid = f"result-{position}"
+            product = row.get("Product", "")
+            product_value = "" if pd.isna(product) else product
+            tags = (tag,) if tag else ()
+            self.product_tree.insert("", "end", iid=iid, values=(product_value,), tags=tags)
+            self.tree.insert("", "end", iid=iid, values=values, tags=tags)
         self.tree.xview_moveto(0)
+        self.product_tree.yview_moveto(0)
         self.tree.yview_moveto(0)
 
     def export_results(self) -> None:

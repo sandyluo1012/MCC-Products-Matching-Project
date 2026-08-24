@@ -6,6 +6,7 @@ from clean_catalogs import trim_cell
 from matching_model import (
     DATA_DIR,
     is_bounded_numeric_value,
+    infer_features,
     load_catalog,
     parse_numeric_values,
     recommend,
@@ -54,6 +55,28 @@ class NumericParsingTests(unittest.TestCase):
 
 
 class CatalogRegressionTests(unittest.TestCase):
+    def test_recommendation_includes_parameters_missing_from_query(self) -> None:
+        path = next(DATA_DIR.glob("*power-mosfets*.csv"))
+        catalog = load_catalog(path)
+        numeric, categorical = infer_features(catalog)
+        source = catalog.iloc[0]
+        active_column = next(
+            column for column in numeric
+            if parse_numeric_values(source[column])
+        )
+        results = recommend(
+            catalog,
+            {
+                "Package Type": source["Package Type"],
+                active_column: source[active_column],
+            },
+            top_k=1,
+        )
+
+        self.assertFalse(results.empty)
+        expected_parameters = {"Package Type", *categorical, *numeric}
+        self.assertTrue(expected_parameters.issubset(results.columns))
+
     def test_invalid_query_is_reported_even_when_hard_constraints_have_no_match(self) -> None:
         path = next(DATA_DIR.glob("*power-mosfets*.csv"))
         catalog = load_catalog(path)

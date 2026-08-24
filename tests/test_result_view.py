@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from app import build_result_view
+from app import _gui_manufacturer, _result_column_width, build_result_view
 
 
 class ResultViewTests(unittest.TestCase):
@@ -61,18 +61,22 @@ class ResultViewTests(unittest.TestCase):
         view = build_result_view(
             self.results,
             compact=True,
-            critical_columns={"Drain-Source Voltage VDS (V)"},
+            candidate_columns=[
+                "Package Type", "Channel", "Drain-Source Voltage VDS (V)",
+                "Junction Temperature Tj [max] (°C)",
+            ],
         )
         self.assertEqual(
             view.columns.tolist(),
             [
-                "Product", "Manufacture", "综合得分", "已知参数匹配度", "参数覆盖率",
-                "可信度", "关键参数检查", "车规等级", "Package Type", "Channel",
-                "Drain-Source Voltage VDS (V)", "关键参数问题", "缺失参数", "风险提示",
+                "Product", "Manufacture", "综合得分", "可信度", "关键参数检查",
+                "车规等级", "Package Type", "Channel", "Drain-Source Voltage VDS (V)",
+                "Junction Temperature Tj [max] (°C)", "关键参数问题", "缺失参数", "风险提示",
             ],
         )
+        self.assertNotIn("已知参数匹配度", view.columns)
+        self.assertNotIn("参数覆盖率", view.columns)
         self.assertNotIn("方向偏好得分", view.columns)
-        self.assertNotIn("Junction Temperature Tj [max] (°C)", view.columns)
         self.assertNotIn("核对提示", view.columns)
 
     def test_filters_can_be_combined_without_mutating_full_results(self) -> None:
@@ -81,10 +85,34 @@ class ResultViewTests(unittest.TestCase):
             self.results,
             compact=True,
             automotive_only=True,
-            critical_columns={"Drain-Source Voltage VDS (V)"},
+            candidate_columns=[
+                "Package Type", "Channel", "Drain-Source Voltage VDS (V)",
+                "Junction Temperature Tj [max] (°C)",
+            ],
         )
         self.assertEqual(view["Product"].tolist(), ["AUTO-1"])
         pd.testing.assert_frame_equal(self.results, original)
+
+    def test_narrative_columns_do_not_dominate_important_columns(self) -> None:
+        self.assertLess(
+            _result_column_width("关键参数问题"),
+            _result_column_width("Product"),
+        )
+        self.assertLess(
+            _result_column_width("缺失参数"),
+            _result_column_width("Product"),
+        )
+        self.assertGreaterEqual(_result_column_width("综合得分"), 90)
+
+    def test_mcc_is_abbreviated_only_for_gui_display(self) -> None:
+        full_name = "MCC (Micro Commercial Components)"
+        self.assertEqual(_gui_manufacturer(full_name), "MCC")
+        self.assertEqual(_gui_manufacturer("Nexperia"), "Nexperia")
+
+        results = self.results.copy()
+        results.loc[0, "Manufacture"] = full_name
+        view = build_result_view(results)
+        self.assertEqual(view.loc[0, "Manufacture"], full_name)
 
 
 if __name__ == "__main__":
