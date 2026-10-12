@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import pandas as pd
+
 from clean_catalogs import trim_cell
 from matching_model import (
     DATA_DIR,
@@ -55,6 +57,29 @@ class NumericParsingTests(unittest.TestCase):
 
 
 class CatalogRegressionTests(unittest.TestCase):
+    def test_active_and_preferred_statuses_do_not_create_risk_warnings(self) -> None:
+        catalog = pd.DataFrame(
+            {
+                "Product": ["ACTIVE-PART", "PREFERRED-PART", "ALLOCATION-PART"],
+                "Manufacture": ["MCC", "MCC", "MCC"],
+                "Status": ["Active", "  PREFERRED  ", "Allocation"],
+                "Package Type": ["SOT-23", "SOT-23", "SOT-23"],
+                "Test Parameter (V)": [5.0, 5.0, 5.0],
+            }
+        )
+
+        results = recommend(
+            catalog,
+            {"Package Type": "SOT-23", "Test Parameter (V)": 5.0},
+            top_k=3,
+        ).set_index("Product")
+
+        self.assertEqual(results.loc["ACTIVE-PART", "风险提示"], "无")
+        self.assertEqual(results.loc["PREFERRED-PART", "风险提示"], "无")
+        self.assertEqual(results.loc["ACTIVE-PART", "可信度"], "高")
+        self.assertEqual(results.loc["PREFERRED-PART", "可信度"], "高")
+        self.assertIn("状态为 Allocation", results.loc["ALLOCATION-PART", "风险提示"])
+
     def test_recommendation_includes_parameters_missing_from_query(self) -> None:
         path = next(DATA_DIR.glob("*power-mosfets*.csv"))
         catalog = load_catalog(path)

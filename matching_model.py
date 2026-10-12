@@ -30,6 +30,7 @@ NON_FEATURE_COLUMNS = {
 MISSING_MARKERS = {"", "-", "—", "nan", "none", "n/a", "na", "null"}
 MIN_COVERAGE = 0.50
 PLUS_MINUS_DEFAULT_RATIO = 0.90
+NORMAL_PRODUCT_STATUSES = frozenset({"active", "preferred"})
 NUMBER_TOKEN = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 # MCC 当前只有 ESD IEC 数值会在单元格中重复写入 kV；其他单位已经在列名中。
 # 使用白名单而不是任意字母后缀，避免把 ``24abc`` 静默当成 24。
@@ -718,7 +719,7 @@ def recommend(
         final_score = base_score * rule_factor
 
         status = _category_value(candidate.get("Status"))
-        if status and status != "active":
+        if status and status not in NORMAL_PRODUCT_STATUSES:
             risks.append(f"状态为 {candidate.get('Status')}")
         if family == "mosfet" and "wide soa" in source_name:
             risks.append("SOA 曲线未验证")

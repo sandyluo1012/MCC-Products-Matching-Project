@@ -53,27 +53,33 @@ CATALOG_CHINESE_NAMES = {
     "wide soa mosfets": "宽安全工作区MOSFETs",
 }
 
-DEEPSEEK_MANUFACTURERS = (
-    "DIODES",
-    "Infineon",
-    "Nexperia",
-    "ON",
-    "st",
-    "TI",
-    "VISHAY",
-    "强茂",
-    "瞬雷",
-    "扬杰",
-    "长电科技",
-    "长晶",
-    "贝岭",
-    "杰华特",
-    "小华",
-    "NXP",
-    "聚鼎",
-    "力特",
-    "LRC",
-    "槟城",
+# (GUI 显示名, DeepSeek 使用的规范名, 可识别别名)。显示和值分离，避免把
+# “英文（中文）”标签直接用于 DeepSeek 的严格制造商身份校验。
+DEEPSEEK_MANUFACTURER_OPTIONS = (
+    ("Diodes Incorporated（达尔科技）", "Diodes Incorporated", ("DIODES", "Diodes Inc.", "达尔", "达尔科技")),
+    ("Infineon（英飞凌）", "Infineon", ("Infineon Technologies", "英飞凌")),
+    ("Nexperia（安世半导体）", "Nexperia", ("安世", "安世半导体")),
+    ("onsemi（安森美）", "onsemi", ("ON", "ON Semiconductor", "安森美", "安森美半导体")),
+    ("STMicroelectronics（意法半导体）", "STMicroelectronics", ("ST", "意法", "意法半导体")),
+    ("Texas Instruments（德州仪器）", "Texas Instruments", ("TI", "德州仪器")),
+    ("Vishay（威世）", "Vishay", ("VISHAY", "威世")),
+    ("PANJIT（强茂）", "PANJIT", ("PANJIT International", "强茂")),
+    ("SPSEMI（瞬雷）", "SPSEMI", ("瞬雷", "上海瞬雷", "瞬雷科技")),
+    ("Yangjie Technology（扬杰科技）", "Yangjie Technology", ("扬杰", "扬杰科技")),
+    ("JCET（长电科技）", "JCET", ("长电", "长电科技")),
+    ("JSCJ（长晶科技）", "JSCJ", ("长晶", "长晶科技")),
+    ("Shanghai Belling（上海贝岭）", "Shanghai Belling", ("Belling", "贝岭", "上海贝岭")),
+    ("JoulWatt（杰华特）", "JoulWatt", ("杰华特", "杰华特微电子")),
+    ("XHSC（小华半导体）", "XHSC", ("小华", "小华半导体")),
+    ("NXP Semiconductors（恩智浦）", "NXP Semiconductors", ("NXP", "恩智浦")),
+    ("Polytronics（聚鼎科技）", "Polytronics", ("Polytronics Technology", "聚鼎", "聚鼎科技")),
+    ("Littelfuse（力特）", "Littelfuse", ("力特",)),
+    ("LRC（乐山无线电）", "LRC", ("Leshan Radio Company", "乐山无线电")),
+    ("Bencent（槟城电子）", "Bencent", ("槟城", "槟城电子")),
+)
+DEEPSEEK_MANUFACTURERS = tuple(
+    display_name for display_name, _canonical_name, _aliases
+    in DEEPSEEK_MANUFACTURER_OPTIONS
 )
 
 COMPACT_RESULT_LEADING_COLUMNS = (
@@ -237,7 +243,7 @@ def _result_identity(result: Any) -> tuple[str, str]:
 
 
 def _manufacturer_key(value: Any) -> str:
-    """规范化制造商名称；仅合并明确等价的 MCC 名称。"""
+    """规范化制造商名称，并合并菜单中明确登记的中英文别名。"""
     normalized = unicodedata.normalize("NFKC", _usable_text(value)).casefold()
     compact = "".join(char for char in normalized if char.isalnum())
     if compact in {
@@ -246,7 +252,32 @@ def _manufacturer_key(value: Any) -> str:
         "mccmicrocommercialcomponents",
     }:
         return "microcommercialcomponents"
+    for display_name, canonical_name, aliases in DEEPSEEK_MANUFACTURER_OPTIONS:
+        registered_names = (display_name, canonical_name, *aliases)
+        registered_keys = {
+            "".join(
+                char
+                for char in unicodedata.normalize("NFKC", name).casefold()
+                if char.isalnum()
+            )
+            for name in registered_names
+        }
+        if compact in registered_keys:
+            return "".join(
+                char
+                for char in unicodedata.normalize("NFKC", canonical_name).casefold()
+                if char.isalnum()
+            )
     return compact
+
+
+def _manufacturer_service_name(value: Any) -> str:
+    """把 GUI 显示名转换成传给 DeepSeek 的规范英文制造商名。"""
+    text = _usable_text(value)
+    for display_name, canonical_name, _aliases in DEEPSEEK_MANUFACTURER_OPTIONS:
+        if text == display_name:
+            return canonical_name
+    return text
 
 
 def _same_manufacturer(first: Any, second: Any) -> bool:
@@ -852,7 +883,7 @@ class MatchingApp(tk.Tk):
             messagebox.showinfo("请输入物料号", "请先输入客户正在使用的完整物料号。")
             self.product_entry.focus_set()
             return
-        manufacturer_hint = self.manufacturer_var.get().strip()
+        manufacturer_hint = _manufacturer_service_name(self.manufacturer_var.get())
 
         categories = list(dict.fromkeys(
             _catalog_category_name(display_name)

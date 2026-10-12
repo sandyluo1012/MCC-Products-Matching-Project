@@ -17,6 +17,7 @@ from app import (
     _classification_is_ambiguous,
     _classification_payload,
     _existing_option,
+    _manufacturer_service_name,
     _same_manufacturer,
 )
 
@@ -101,11 +102,39 @@ class DeepSeekAutofillTests(unittest.TestCase):
         self.assertEqual(
             DEEPSEEK_MANUFACTURERS,
             (
-                "DIODES", "Infineon", "Nexperia", "ON", "st", "TI", "VISHAY",
-                "强茂", "瞬雷", "扬杰", "长电科技", "长晶", "贝岭", "杰华特", "小华",
-                "NXP", "聚鼎", "力特", "LRC", "槟城",
+                "Diodes Incorporated（达尔科技）",
+                "Infineon（英飞凌）",
+                "Nexperia（安世半导体）",
+                "onsemi（安森美）",
+                "STMicroelectronics（意法半导体）",
+                "Texas Instruments（德州仪器）",
+                "Vishay（威世）",
+                "PANJIT（强茂）",
+                "SPSEMI（瞬雷）",
+                "Yangjie Technology（扬杰科技）",
+                "JCET（长电科技）",
+                "JSCJ（长晶科技）",
+                "Shanghai Belling（上海贝岭）",
+                "JoulWatt（杰华特）",
+                "XHSC（小华半导体）",
+                "NXP Semiconductors（恩智浦）",
+                "Polytronics（聚鼎科技）",
+                "Littelfuse（力特）",
+                "LRC（乐山无线电）",
+                "Bencent（槟城电子）",
             ),
         )
+
+    def test_manufacturer_display_names_map_to_canonical_service_names(self) -> None:
+        self.assertEqual(
+            _manufacturer_service_name("onsemi（安森美）"),
+            "onsemi",
+        )
+        self.assertEqual(
+            _manufacturer_service_name("Bencent（槟城电子）"),
+            "Bencent",
+        )
+        self.assertEqual(_manufacturer_service_name(""), "")
 
     def test_category_maps_only_to_an_existing_catalog(self) -> None:
         catalogs = {
@@ -155,6 +184,12 @@ class DeepSeekAutofillTests(unittest.TestCase):
                 "onsemi",
             )
         )
+
+    def test_registered_manufacturer_aliases_match_without_merging_brands(self) -> None:
+        self.assertTrue(_same_manufacturer("ON Semiconductor", "onsemi（安森美）"))
+        self.assertTrue(_same_manufacturer("TI", "Texas Instruments"))
+        self.assertTrue(_same_manufacturer("瞬雷", "SPSEMI"))
+        self.assertFalse(_same_manufacturer("NXP", "Nexperia"))
 
     def test_classification_switches_catalog_then_uses_the_new_schema(self) -> None:
         target = "Power Mosfets（功率MOSFETs）"
