@@ -18,6 +18,7 @@ from app import (
     _classification_payload,
     _existing_option,
     _manufacturer_service_name,
+    _restore_plus_minus_default,
     _same_manufacturer,
 )
 
@@ -467,6 +468,13 @@ class DeepSeekAutofillTests(unittest.TestCase):
         self.assertEqual(_existing_option("  sot-23 ", ["SOT-23"]), "SOT-23")
         self.assertIsNone(_existing_option("SOT23", ["SOT-23"]))
 
+    def test_plus_minus_default_normalization_is_conservative(self) -> None:
+        self.assertEqual(_restore_plus_minus_default("20", "±"), "±20")
+        self.assertEqual(_restore_plus_minus_default("20/25", "±"), "±20/±25")
+        self.assertEqual(_restore_plus_minus_default("±20", "±"), "±20")
+        self.assertEqual(_restore_plus_minus_default("+20/-16", "±"), "+20/-16")
+        self.assertEqual(_restore_plus_minus_default("20", ""), "20")
+
     @patch("app.messagebox.showwarning")
     def test_pair_values_are_filled_without_changing_results(self, warning) -> None:
         app = fake_app()
@@ -480,7 +488,8 @@ class DeepSeekAutofillTests(unittest.TestCase):
                 "Package Type": "sop-8",
                 "Channel": "n+p",
                 id_column: "24/-18",
-                vgs_column: "±20",
+                # API 可能把规格书中的 ±20 作为 JSON 数字 20 返回。
+                vgs_column: 20,
             },
             uncertain_fields=[],
             notes=["请核对规格书"],
@@ -500,6 +509,57 @@ class DeepSeekAutofillTests(unittest.TestCase):
         self.assertEqual(app.product_var.get(), "CUSTOM-1")
         self.assertIs(app.results, old_results)
         self.assertIn("已填入 4 项", app.status_var.get())
+        warning.assert_called_once()
+
+    @patch("app.messagebox.showwarning")
+    def test_explicit_asymmetric_vgs_is_not_rewritten(self, warning) -> None:
+        app = fake_app()
+        vgs_column = "Gate-Source Voltage VGS (V)"
+
+        MatchingApp._apply_autofill_values(
+            app,
+            {vgs_column: "+20/-16"},
+            uncertain_fields=[],
+            notes=[],
+            source="DeepSeek",
+        )
+
+        self.assertEqual(app.inputs[vgs_column].get(), "+20/-16")
+        warning.assert_called_once()
+
+    @patch("app.messagebox.showwarning")
+    def test_unsigned_pair_vgs_restores_plus_minus_per_side(self, warning) -> None:
+        app = fake_app()
+        vgs_column = "Gate-Source Voltage VGS (V)"
+
+        MatchingApp._apply_autofill_values(
+            app,
+            {"Channel": "n+p", vgs_column: "20/25"},
+            uncertain_fields=[],
+            notes=[],
+            source="DeepSeek",
+        )
+
+        self.assertEqual(
+            tuple(var.get() for var in app.paired_inputs[vgs_column]),
+            ("±20", "±25"),
+        )
+        self.assertIn("补回 ±", warning.call_args.args[1])
+
+    @patch("app.messagebox.showwarning")
+    def test_non_plus_minus_numeric_field_is_not_rewritten(self, warning) -> None:
+        app = fake_app()
+        id_column = "Drain Current ID (A)"
+
+        MatchingApp._apply_autofill_values(
+            app,
+            {id_column: 24},
+            uncertain_fields=[],
+            notes=[],
+            source="DeepSeek",
+        )
+
+        self.assertEqual(app.inputs[id_column].get(), "24")
         warning.assert_called_once()
 
     @patch("app.messagebox.showwarning")

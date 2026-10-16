@@ -16,6 +16,8 @@ import pandas as pd
 
 from deepseek_service import classify_part_category, lookup_part_parameters
 from matching_model import (
+    BALANCED_MODE,
+    STRICT_MODE,
     critical_features,
     discover_catalogs,
     infer_features,
@@ -82,12 +84,23 @@ DEEPSEEK_MANUFACTURERS = tuple(
     in DEEPSEEK_MANUFACTURER_OPTIONS
 )
 
+MATCH_MODE_OPTIONS = (
+    ("严格模式", STRICT_MODE),
+    ("平衡/整体接近模式", BALANCED_MODE),
+)
+MATCH_MODE_BY_LABEL = dict(MATCH_MODE_OPTIONS)
+MATCH_MODE_LABEL_BY_VALUE = {
+    value: label for label, value in MATCH_MODE_OPTIONS
+}
+
 COMPACT_RESULT_LEADING_COLUMNS = (
-    "Product", "Manufacture", "综合得分", "可信度", "关键参数检查", "车规等级",
+    "Product", "Manufacture", "综合得分", "关键规则符合度", "可信度",
+    "关键参数检查", "车规等级",
 )
 COMPACT_RESULT_TRAILING_COLUMNS = ("关键参数问题", "缺失参数", "风险提示")
 NON_CANDIDATE_RESULT_COLUMNS = {
-    "综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分", "已比较参数",
+    "综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分", "关键规则符合度",
+    "已比较参数",
     "可信度", "关键参数检查", "关键参数问题", "缺失参数", "风险提示", "核对提示",
     "车规等级",
 }
@@ -99,6 +112,7 @@ RESULT_COLUMN_WIDTHS = {
     "已知参数匹配度": 120,
     "参数覆盖率": 105,
     "方向偏好得分": 115,
+    "关键规则符合度": 120,
     "可信度": 75,
     "关键参数检查": 110,
     "车规等级": 85,
@@ -116,6 +130,15 @@ RESULT_COLUMN_WIDTHS = {
 RESULT_LEFT_ALIGNED_COLUMNS = {
     "Product", "Manufacture", "关键参数问题", "缺失参数", "风险提示", "核对提示",
 }
+
+
+def _match_mode_value(label: Any) -> str:
+    """把 GUI 显示名映射为模型模式；未知值安全回退到严格模式。"""
+    return MATCH_MODE_BY_LABEL.get(str(label), STRICT_MODE)
+
+
+def _match_mode_label(value: str) -> str:
+    return MATCH_MODE_LABEL_BY_VALUE.get(value, "严格模式")
 
 
 def _localized_catalogs(catalogs: dict[str, Path]) -> dict[str, Path]:
@@ -178,6 +201,30 @@ def _usable_text(value: Any) -> str:
     except (TypeError, ValueError):
         return ""
     return str(value).strip()
+
+
+def _restore_plus_minus_default(text: str, default_value: str) -> str:
+    """为默认使用 ``±`` 的字段恢复被 API 数字类型丢掉的符号。
+
+    DeepSeek 有时会把规格书中的 ``±20`` 作为 JSON 数字 ``20`` 返回。
+    只有当前目录已把该字段识别为正负对称额定值、且返回值是无符号单值时
+    才补回符号；``+20/-16`` 等显式非对称额定值必须保持原样。
+    """
+    if default_value.strip() != "±":
+        return text
+
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    if not normalized:
+        return text
+    parts = [part.strip() for part in normalized.split("/")]
+    if len(parts) not in {1, 2} or not all(parts):
+        return text
+    # 只要服务保留了任意显式符号，就尊重其原始语义，不猜测或改写。
+    if any(part.startswith(("±", "+", "-", "−")) for part in parts):
+        return text
+    if len(parse_numeric_values(normalized)) != len(parts):
+        return text
+    return "/".join(f"±{part}" for part in parts)
 
 
 def _lookup_payload(result: Any) -> tuple[dict[str, Any], list[str], list[str]]:
@@ -375,11 +422,14 @@ class MatchingApp(tk.Tk):
         self.previous_pair_selector_value = ""
         self.results = pd.DataFrame()
         self.has_run_match = False
+        self.results_mode = STRICT_MODE
         self.candidate_parameter_columns: list[str] = []
         self._syncing_result_scroll = False
         self._syncing_result_selection = False
         self.compact_results_var = tk.BooleanVar(value=False)
         self.automotive_only_var = tk.BooleanVar(value=False)
+        self.match_mode_var = tk.StringVar(value="严格模式")
+        self.result_mode_var = tk.StringVar(value="本表模式：尚未匹配")
         self.deepseek_api_key_var = tk.StringVar(
             value=os.environ.get("DEEPSEEK_API_KEY", "")
         )
@@ -409,7 +459,11 @@ class MatchingApp(tk.Tk):
         root = ttk.Frame(self, padding=20)
         root.pack(fill="both", expand=True)
         ttk.Label(root, text="芯片替代料智能匹配", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(root, text="硬约束过滤 · 缺失感知相似度 · 参数覆盖率与风险提示", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
+        ttk.Label(
+            root,
+            text="严格/平衡双模式 · 硬约束过滤 · 缺失感知相似度 · 参数覆盖率与风险提示",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(2, 16))
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", pady=(0, 12))
@@ -421,6 +475,16 @@ class MatchingApp(tk.Tk):
         ttk.Label(bar, text="推荐数量").pack(side="left")
         self.top_var = tk.IntVar(value=10)
         ttk.Spinbox(bar, from_=1, to=50, textvariable=self.top_var, width=6).pack(side="left", padx=8)
+        ttk.Label(bar, text="匹配模式").pack(side="left", padx=(12, 0))
+        self.match_mode_box = ttk.Combobox(
+            bar,
+            textvariable=self.match_mode_var,
+            values=[label for label, _value in MATCH_MODE_OPTIONS],
+            state="readonly",
+            width=19,
+        )
+        self.match_mode_box.pack(side="left", padx=(8, 0))
+        self.match_mode_box.bind("<<ComboboxSelected>>", self._match_mode_changed)
         self.count_label = ttk.Label(bar, text="", style="Sub.TLabel")
         self.count_label.pack(side="right")
 
@@ -511,6 +575,11 @@ class MatchingApp(tk.Tk):
         ttk.Button(action, text="开始匹配", style="Accent.TButton", command=self.run_match).pack(side="left")
         ttk.Button(action, text="清空输入", command=self.clear_inputs).pack(side="left", padx=(8, 0))
         ttk.Button(action, text="导出结果 CSV", command=self.export_results).pack(side="left", padx=8)
+        ttk.Button(
+            action,
+            text="复制物料号",
+            command=self.copy_selected_product_numbers,
+        ).pack(side="left", padx=(0, 8))
         ttk.Checkbutton(
             action,
             text="精简显示",
@@ -525,6 +594,11 @@ class MatchingApp(tk.Tk):
         ).pack(side="left")
         self.status_var = tk.StringVar(value="请填写参数后开始匹配")
         ttk.Label(action, textvariable=self.status_var, style="Sub.TLabel").pack(side="right")
+        ttk.Label(
+            right,
+            textvariable=self.result_mode_var,
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
         table_frame = ttk.Frame(right)
         table_frame.pack(fill="both", expand=True)
         # 用固定宽度容器统一 Product 列与冻结分隔线的位置。Treeview 的主题边框
@@ -536,11 +610,11 @@ class MatchingApp(tk.Tk):
         # 边框仍会把 180 px 容器撑成 182 px。
         self.product_pane.pack_propagate(False)
         self.product_tree = ttk.Treeview(
-            self.product_pane, show="headings", selectmode="browse", height=10,
+            self.product_pane, show="headings", selectmode="extended", height=10,
         )
         self.product_tree.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(
-            table_frame, show="headings", selectmode="browse", height=10,
+            table_frame, show="headings", selectmode="extended", height=10,
         )
         ybar = ttk.Scrollbar(
             table_frame, orient="vertical", command=self._scroll_result_trees,
@@ -560,9 +634,15 @@ class MatchingApp(tk.Tk):
         )
         for result_tree in (self.product_tree, self.tree):
             result_tree.tag_configure("passed", background="#edf8ef", foreground="#205c2e")
+            result_tree.tag_configure("conditional", background="#fff0d6", foreground="#8a4b08")
             result_tree.tag_configure("pending", background="#fff7df", foreground="#765b00")
             result_tree.tag_configure("failed", background="#ffe9e9", foreground="#8a2020")
             result_tree.bind("<<TreeviewSelect>>", self._sync_result_selection)
+            result_tree.bind("<Control-c>", self.copy_selected_product_numbers)
+            result_tree.bind("<Control-C>", self.copy_selected_product_numbers)
+        self.product_tree.bind(
+            "<Double-1>", self.copy_selected_product_numbers, add="+",
+        )
         self.product_pane.grid(row=0, column=0, sticky="ns")
         self.tree.grid(row=0, column=1, sticky="nsew")
         ybar.grid(row=0, column=2, sticky="ns")
@@ -621,6 +701,58 @@ class MatchingApp(tk.Tk):
                 target.see(selection[0])
         finally:
             self._syncing_result_selection = False
+
+    def copy_selected_product_numbers(
+        self,
+        _event: tk.Event | None = None,
+    ) -> str:
+        """把结果表中选中行的物料号复制到剪贴板。"""
+        selection = self.product_tree.selection() or self.tree.selection()
+        visible_order = {
+            item_id: position
+            for position, item_id in enumerate(self.product_tree.get_children(""))
+        }
+        selection = tuple(sorted(
+            selection,
+            key=lambda item_id: visible_order.get(item_id, len(visible_order)),
+        ))
+        products: list[str] = []
+        for item_id in selection:
+            values = self.product_tree.item(item_id, "values")
+            if not values:
+                continue
+            product = str(values[0]).strip()
+            if product:
+                products.append(product)
+
+        if not products:
+            self.status_var.set("请先在匹配结果中选择要复制的物料")
+            return "break"
+
+        unique_products = list(dict.fromkeys(products))
+        text = "\n".join(unique_products)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        if len(unique_products) == 1:
+            self.status_var.set(f"已复制物料号：{unique_products[0]}")
+        else:
+            self.status_var.set(f"已复制 {len(unique_products)} 个物料号（每行一个）")
+        return "break"
+
+    def _match_mode_changed(self, _event: tk.Event | None = None) -> None:
+        """模式只影响下一次匹配，避免把旧结果误认为已被重新计算。"""
+        selected_mode = _match_mode_value(self.match_mode_var.get())
+        if self.has_run_match and selected_mode != self.results_mode:
+            self.status_var.set(
+                f"已选择 {_match_mode_label(selected_mode)}；当前表仍是 "
+                f"{_match_mode_label(self.results_mode)} 结果，请重新点击开始匹配"
+            )
+        elif self.has_run_match:
+            self._refresh_results_view()
+        else:
+            self.status_var.set(
+                f"已选择 {_match_mode_label(selected_mode)}，请填写参数后开始匹配"
+            )
 
     def _toggle_api_key_visibility(self) -> None:
         """只切换输入框的本地显示方式，不复制、记录或持久化 Key。"""
@@ -791,6 +923,8 @@ class MatchingApp(tk.Tk):
         self._bind_customer_mousewheel(self.customer_panel)
         self.results = pd.DataFrame()
         self.has_run_match = False
+        self.results_mode = _match_mode_value(self.match_mode_var.get())
+        self.result_mode_var.set("本表模式：尚未匹配")
         if continuing_autofill:
             self.status_var.set(f"已切换到 {self.catalog_var.get()}，正在准备参数查询…")
         else:
@@ -1235,6 +1369,7 @@ class MatchingApp(tk.Tk):
         uncertain_keys = {_option_key(field) for field in uncertain_fields}
         categorical_values: dict[str, str] = {}
         numeric_values: dict[str, str] = {}
+        restored_plus_minus: list[str] = []
         skipped: list[str] = []
         unavailable: list[str] = []
 
@@ -1267,7 +1402,13 @@ class MatchingApp(tk.Tk):
                 if not parse_numeric_values(text):
                     skipped.append(f"{column}（无法识别为严格数值：{text}）")
                     continue
-                numeric_values[column] = text
+                normalized_text = _restore_plus_minus_default(
+                    text,
+                    self.input_defaults.get(column, ""),
+                )
+                numeric_values[column] = normalized_text
+                if normalized_text != text:
+                    restored_plus_minus.append(column)
             else:
                 skipped.append(f"{column}（不是当前可填参数）")
 
@@ -1335,6 +1476,11 @@ class MatchingApp(tk.Tk):
             lines.append(f"已跳过：{_field_summary(skipped)}")
         if unavailable:
             lines.append(f"无可靠值/留空：{_field_summary(unavailable)}")
+        if restored_plus_minus:
+            lines.append(
+                f"已按字段格式补回 ±：{_field_summary(restored_plus_minus)}；"
+                "若原规格为 +x/-y 非对称额定值，请以规格书为准修正"
+            )
         if notes:
             lines.append(f"查询提示：{'；'.join(notes[:5])}")
         lines.append(
@@ -1362,12 +1508,22 @@ class MatchingApp(tk.Tk):
         self.status_var.set("输入已清空；当前匹配结果已保留")
 
     def run_match(self) -> None:
+        selected_mode = _match_mode_value(self.match_mode_var.get())
         try:
             query = self._collect_query()
-            self.results = recommend(self.df, query, top_k=int(self.top_var.get()))
+            self.results = recommend(
+                self.df,
+                query,
+                top_k=int(self.top_var.get()),
+                mode=selected_mode,
+            )
         except Exception as exc:
             messagebox.showerror("无法匹配", str(exc))
             return
+        self.results_mode = selected_mode
+        self.result_mode_var.set(
+            f"本表模式：{_match_mode_label(self.results_mode)}"
+        )
         self.has_run_match = True
         self._refresh_results_view()
 
@@ -1386,20 +1542,40 @@ class MatchingApp(tk.Tk):
         if not self.has_run_match:
             self.status_var.set("请填写参数后开始匹配")
             return
+        mode_label = _match_mode_label(self.results_mode)
+        selected_mode = _match_mode_value(self.match_mode_var.get())
+        stale_suffix = (
+            f"；已选择 {_match_mode_label(selected_mode)}，需重新匹配"
+            if selected_mode != self.results_mode
+            else ""
+        )
         if self.results.empty:
-            self.status_var.set("没有满足封装和最低参数覆盖率的物料")
+            self.status_var.set(
+                f"{mode_label}：没有满足封装和最低参数覆盖率的物料{stale_suffix}"
+            )
             return
         if filtered.empty:
-            self.status_var.set(f"完整结果有 {len(self.results)} 个候选，当前筛选下没有车规级物料")
+            self.status_var.set(
+                f"{mode_label}：完整结果有 {len(self.results)} 个候选，"
+                f"当前筛选下没有车规级物料{stale_suffix}"
+            )
             return
         verified = int((filtered["关键参数检查"] == "通过").sum())
+        conditional = int((filtered["关键参数检查"] == "有条件推荐").sum())
+        pending = int((filtered["关键参数检查"] == "待人工确认").sum())
+        summary = f"{verified} 个通过"
+        if conditional:
+            summary += f"，{conditional} 个有条件推荐"
+        if pending:
+            summary += f"，{pending} 个待人工确认"
         if self.automotive_only_var.get():
             self.status_var.set(
-                f"显示 {len(filtered)}/{len(self.results)} 个车规级候选，其中 {verified} 个通过关键参数规则"
+                f"{mode_label}：显示 {len(filtered)}/{len(self.results)} 个车规级候选，"
+                f"其中 {summary}{stale_suffix}"
             )
         else:
             self.status_var.set(
-                f"找到 {len(filtered)} 个候选，其中 {verified} 个通过关键参数规则"
+                f"{mode_label}：找到 {len(filtered)} 个候选，其中 {summary}{stale_suffix}"
             )
 
     def _show(self, data: pd.DataFrame) -> None:
@@ -1432,14 +1608,22 @@ class MatchingApp(tk.Tk):
                 value = row.get(col)
                 if col == "Manufacture":
                     values.append("" if pd.isna(value) else _gui_manufacturer(value))
-                elif col in {"综合得分", "已知参数匹配度", "参数覆盖率", "方向偏好得分"}:
+                elif col in {
+                    "综合得分", "已知参数匹配度", "参数覆盖率",
+                    "方向偏好得分", "关键规则符合度",
+                }:
                     values.append(f"{float(value):.1f}%")
                 elif isinstance(value, float):
                     values.append("" if pd.isna(value) else f"{value:g}")
                 else:
                     values.append("" if pd.isna(value) else value)
             status = str(row.get("关键参数检查", ""))
-            tag = {"通过": "passed", "待人工确认": "pending", "不满足": "failed"}.get(status, "")
+            tag = {
+                "通过": "passed",
+                "有条件推荐": "conditional",
+                "待人工确认": "pending",
+                "不满足": "failed",
+            }.get(status, "")
             iid = f"result-{position}"
             product = row.get("Product", "")
             product_value = "" if pd.isna(product) else product
@@ -1461,7 +1645,9 @@ class MatchingApp(tk.Tk):
         if export_data.empty:
             messagebox.showinfo("暂无结果", "当前筛选下没有可导出的物料。")
             return
-        initialfile = "车规级匹配结果.csv" if self.automotive_only_var.get() else "匹配结果.csv"
+        mode_prefix = "平衡模式" if self.results_mode == BALANCED_MODE else "严格模式"
+        scope_prefix = "车规级" if self.automotive_only_var.get() else ""
+        initialfile = f"{mode_prefix}{scope_prefix}匹配结果.csv"
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV 文件", "*.csv")],

@@ -12,10 +12,12 @@ import pandas as pd
 
 from matching_rules import (
     SOFT_DIRECTION_INFLUENCE,
+    continuous_rule_score,
     get_rule,
     passes_rule,
     preference_score,
     requirement_text,
+    violation_ratio,
 )
 
 
@@ -31,6 +33,12 @@ MISSING_MARKERS = {"", "-", "—", "nan", "none", "n/a", "na", "null"}
 MIN_COVERAGE = 0.50
 PLUS_MINUS_DEFAULT_RATIO = 0.90
 NORMAL_PRODUCT_STATUSES = frozenset({"active", "preferred"})
+STRICT_MODE = "strict"
+BALANCED_MODE = "balanced"
+MATCH_MODES = frozenset({STRICT_MODE, BALANCED_MODE})
+# 平衡模式只对可权衡关键规则做温和的二次修正；数值距离已经在
+# 缺失感知相似度中按关键参数双倍权重计算，不能再次重罚。
+BALANCED_CRITICAL_INFLUENCE = 0.25
 NUMBER_TOKEN = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 # MCC 当前只有 ESD IEC 数值会在单元格中重复写入 kV；其他单位已经在列名中。
 # 使用白名单而不是任意字母后缀，避免把 ``24abc`` 静默当成 24。
@@ -431,21 +439,71 @@ def _component_preference(
     ) / len(query_values)
 
 
+def _component_continuous_rule_score(
+    rule: Any,
+    query_values: tuple[float, ...],
+    candidate_values: tuple[float, ...],
+) -> float:
+    """成对器件按最差一侧计分，避免另一侧的好参数掩盖关键偏差。"""
+    return min(
+        continuous_rule_score(rule, query_value, candidate_value)
+        for query_value, candidate_value in zip(query_values, candidate_values)
+    )
+
+
+def _component_violation_ratio(
+    rule: Any,
+    query_values: tuple[float, ...],
+    candidate_values: tuple[float, ...],
+) -> float:
+    return max(
+        violation_ratio(rule, query_value, candidate_value)
+        for query_value, candidate_value in zip(query_values, candidate_values)
+    )
+
+
+def _violation_suffix(
+    rule: Any,
+    query_value: float,
+    candidate_value: float,
+) -> str:
+    if abs(query_value) <= 1e-12:
+        return f"，绝对偏差 {abs(candidate_value - query_value):g}"
+    return f"，超出规则 {violation_ratio(rule, query_value, candidate_value):.1%}"
+
+
 def _rule_failure_text(
     column: str,
     rule: Any,
     query_values: tuple[float, ...],
     candidate_values: tuple[float, ...],
     component_labels: tuple[str, ...] | None = None,
+    include_violation: bool = False,
 ) -> str:
+    if len(query_values) == 1:
+        text = (
+            f"{column}={candidate_values[0]:g}，"
+            f"要求{requirement_text(rule, query_values[0])}"
+        )
+        if include_violation:
+            text += _violation_suffix(
+                rule, query_values[0], candidate_values[0],
+            )
+        return text
+
     labels = component_labels or tuple(str(index + 1) for index in range(len(query_values)))
     failures = [
-        f"{label}={candidate_value:g}，要求{requirement_text(rule, query_value)}"
+        (
+            f"{label}={candidate_value:g}，要求{requirement_text(rule, query_value)}"
+            + (
+                _violation_suffix(rule, query_value, candidate_value)
+                if include_violation
+                else ""
+            )
+        )
         for label, query_value, candidate_value in zip(labels, query_values, candidate_values)
         if not passes_rule(rule, query_value, candidate_value)
     ]
-    if len(query_values) == 1:
-        return f"{column}={candidate_values[0]:g}，要求{requirement_text(rule, query_values[0])}"
     return f"{column}：" + "；".join(failures)
 
 
@@ -454,8 +512,11 @@ def recommend(
     query: dict[str, Any],
     top_k: int = 10,
     weights: dict[str, float] | None = None,
+    mode: str = STRICT_MODE,
 ) -> pd.DataFrame:
-    """硬规则过滤后，只用 query/candidate 共同已知的参数计算相似度。"""
+    """硬约束过滤后，按严格或平衡模式推荐共同已知参数最合适的候选。"""
+    if mode not in MATCH_MODES:
+        raise ValueError(f"未知匹配模式：{mode}")
     numeric, categorical = infer_features(inventory)
     source_name = str(inventory.attrs.get("source_name", "")).casefold()
     family = _family(list(inventory.columns), source_name)
@@ -641,6 +702,10 @@ def recommend(
             if rules[column] is not None and rules[column].critical
         )
         failed_reasons: list[str] = []
+        nontradeoff_failed_reasons: list[str] = []
+        tradeoff_failed_reasons: list[str] = []
+        overlimit_failed_reasons: list[str] = []
+        tradeoff_rule_scores: list[tuple[float, float]] = []
         for column in shared:
             rule = rules[column]
             if rule is None:
@@ -650,19 +715,46 @@ def recommend(
             if rule.condition_key and not _condition_is_comparable(condition_column, query, candidate):
                 pending_reasons.append(f"{column}测试条件未验证")
                 continue
-            if not all(
+            rule_passes = all(
                 passes_rule(rule, query_value, candidate_value)
                 for query_value, candidate_value in zip(aligned_query, aligned_candidate)
-            ):
+            )
+            if rule.critical and rule.balanced_tradeoff:
+                tradeoff_rule_scores.append((
+                    feature_weights[column],
+                    _component_continuous_rule_score(
+                        rule, aligned_query, aligned_candidate,
+                    ),
+                ))
+            if not rule_passes:
                 problem = _rule_failure_text(
                     column,
                     rule,
                     aligned_query,
                     aligned_candidate,
                     pair_component_labels if len(aligned_query) == 2 else None,
+                    include_violation=(mode == BALANCED_MODE),
                 )
                 if rule.critical:
                     failed_reasons.append(problem)
+                    if rule.balanced_tradeoff:
+                        component_violation = _component_violation_ratio(
+                            rule, aligned_query, aligned_candidate,
+                        )
+                        if (
+                            mode == BALANCED_MODE
+                            and component_violation > rule.balanced_limit + 1e-12
+                        ):
+                            overlimit_problem = (
+                                f"{problem}（平衡模式可权衡上限 "
+                                f"{rule.balanced_limit:.0%}）"
+                            )
+                            failed_reasons[-1] = overlimit_problem
+                            overlimit_failed_reasons.append(overlimit_problem)
+                        else:
+                            tradeoff_failed_reasons.append(problem)
+                    else:
+                        nontradeoff_failed_reasons.append(problem)
 
         shared_weight = sum(feature_weights[column] for column in shared)
         coverage = shared_weight / total_weight
@@ -692,6 +784,18 @@ def recommend(
         )
         base_score = raw_similarity * direction_factor * (0.70 + 0.30 * coverage)
 
+        if tradeoff_rule_scores:
+            tradeoff_weight = sum(weight for weight, _score in tradeoff_rule_scores)
+            tradeoff_score = sum(
+                weight * score for weight, score in tradeoff_rule_scores
+            ) / tradeoff_weight
+        else:
+            tradeoff_score = 1.0
+        balanced_factor = (
+            1.0 - BALANCED_CRITICAL_INFLUENCE
+            + BALANCED_CRITICAL_INFLUENCE * tradeoff_score
+        )
+
         topology_pending = False
         if _is_multi_function(query.get("Number of Functions")):
             if "Configuration" not in inventory.columns:
@@ -704,18 +808,39 @@ def recommend(
                 pending_reasons.append("候选拓扑缺失")
                 topology_pending = True
 
-        if failed_reasons:
-            critical_status = "不满足"
-            rule_rank = 0
-            rule_factor = 0.60
-        elif pending_reasons or topology_pending:
-            critical_status = "待人工确认"
-            rule_rank = 1
-            rule_factor = 0.85
+        if mode == STRICT_MODE:
+            if failed_reasons:
+                critical_status = "不满足"
+                rule_rank = 0
+                rule_factor = 0.60
+            elif pending_reasons or topology_pending:
+                critical_status = "待人工确认"
+                rule_rank = 1
+                rule_factor = 0.85
+            else:
+                critical_status = "通过"
+                rule_rank = 2
+                rule_factor = 1.0
         else:
-            critical_status = "通过"
-            rule_rank = 2
-            rule_factor = 1.0
+            # 平衡模式只在配置上限内放宽性能规则。耐压、电流能力、保护能力
+            # 等不可权衡规则，以及超过上限的性能偏差，仍然降层。
+            if nontradeoff_failed_reasons or overlimit_failed_reasons:
+                critical_status = "不满足"
+                rule_rank = 0
+                status_factor = 0.60
+            elif pending_reasons or topology_pending:
+                critical_status = "待人工确认"
+                rule_rank = 1
+                status_factor = 0.85
+            elif tradeoff_failed_reasons:
+                critical_status = "有条件推荐"
+                rule_rank = 2
+                status_factor = 1.0
+            else:
+                critical_status = "通过"
+                rule_rank = 2
+                status_factor = 1.0
+            rule_factor = status_factor * balanced_factor
         final_score = base_score * rule_factor
 
         status = _category_value(candidate.get("Status"))
@@ -737,11 +862,26 @@ def recommend(
         else:
             confidence = "低"
 
-        critical_issues = failed_reasons or pending_reasons
-        if failed_reasons:
-            risks.append("存在不满足的关键参数")
-        elif pending_reasons:
-            risks.append("关键参数需要人工确认")
+        if mode == STRICT_MODE:
+            # 保持旧版严格模式的诊断优先级：有失败时只显示失败，
+            # 否则才显示待确认原因。
+            critical_issues = failed_reasons or pending_reasons
+            if failed_reasons:
+                risks.append("存在不满足的关键参数")
+            elif pending_reasons:
+                risks.append("关键参数需要人工确认")
+        else:
+            critical_issues = [*failed_reasons, *pending_reasons]
+            if nontradeoff_failed_reasons:
+                risks.append("存在不可权衡的关键参数问题，方向比较需确认测试条件可比")
+            if overlimit_failed_reasons:
+                risks.append("可权衡关键参数偏差超过平衡模式上限，需确认测试条件可比")
+            if tradeoff_failed_reasons:
+                risks.append(
+                    "可权衡关键参数存在偏差，已连续扣分；需确认测试条件可比"
+                )
+            if pending_reasons:
+                risks.append("关键参数需要人工确认")
 
         row = candidate.to_dict()
         row.update({
@@ -749,6 +889,7 @@ def recommend(
             "已知参数匹配度": raw_similarity * 100,
             "参数覆盖率": coverage * 100,
             "方向偏好得分": direction_preference * 100,
+            "关键规则符合度": rule_factor * 100,
             "已比较参数": f"{len(shared)}/{len(active)}",
             "可信度": confidence,
             "关键参数检查": critical_status,
@@ -763,7 +904,10 @@ def recommend(
                 *(f"{column}（{pair_display_name} 双值不完整）" for column in incompatible),
             ]) if missing or incompatible else "无",
             "风险提示": "；".join(dict.fromkeys(risks)) if risks else "无",
-            "核对提示": "封装名称相同，Pinout/尺寸/原厂规格书仍需人工核对",
+            "核对提示": (
+                "封装名称相同，Pinout/尺寸/原厂规格书仍需人工核对；"
+                "方向偏差百分比仅在测试条件可比时有效"
+            ),
             "车规等级": "车规级" if "A" in str(candidate.get("Compliance", "")).upper().split() else "非车规级",
             "_规则等级": rule_rank,
         })
@@ -775,7 +919,8 @@ def recommend(
 
     summary_columns = [
         "Product", "Manufacture", "综合得分", "已知参数匹配度", "参数覆盖率",
-        "方向偏好得分", "已比较参数", "可信度", "关键参数检查", "车规等级",
+        "方向偏好得分", "关键规则符合度", "已比较参数", "可信度",
+        "关键参数检查", "车规等级",
     ]
     # 推荐表必须携带候选的全部可匹配参数，而不是只返回 query 已填写的 active 参数。
     # 这样 GUI 无论普通/精简模式都能查看候选的完整规格。

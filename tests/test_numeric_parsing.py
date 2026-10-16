@@ -47,6 +47,9 @@ class NumericParsingTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(parse_numeric_values(value), ())
 
+    def test_unsigned_and_symmetric_plus_minus_values_are_numerically_equal(self) -> None:
+        self.assertEqual(parse_numeric_values("20"), parse_numeric_values("±20"))
+
     def test_bounded_value_is_identified_but_not_parsed_as_exact(self) -> None:
         self.assertTrue(is_bounded_numeric_value(">1.2"))
         self.assertEqual(parse_numeric_values(">1.2"), ())
@@ -57,6 +60,26 @@ class NumericParsingTests(unittest.TestCase):
 
 
 class CatalogRegressionTests(unittest.TestCase):
+    def test_power_mosfet_unsigned_and_plus_minus_vgs_rank_identically(self) -> None:
+        path = next(DATA_DIR.glob("*power-mosfets*.csv"))
+        catalog = load_catalog(path)
+        vgs_column = "Gate-Source Voltage VGS (V)"
+        source = catalog[catalog[vgs_column].map(bool)].iloc[0]
+        base_query = {"Package Type": source["Package Type"]}
+
+        unsigned = recommend(
+            catalog,
+            {**base_query, vgs_column: "20"},
+            top_k=20,
+        )
+        symmetric = recommend(
+            catalog,
+            {**base_query, vgs_column: "±20"},
+            top_k=20,
+        )
+
+        pd.testing.assert_frame_equal(unsigned, symmetric)
+
     def test_active_and_preferred_statuses_do_not_create_risk_warnings(self) -> None:
         catalog = pd.DataFrame(
             {

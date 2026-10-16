@@ -57,3 +57,9 @@ Desktop.ini
 匹配结果*.csv
 
 # products/MCC/raw 和 products/MCC/clean 是项目数据，故意纳入版本控制。
+/aaa.ipynb
+/create_database.ipynb
+/test.ipynb
+/test2.ipynb
+/test3.ipynb
+/products/MCC/raw.zip
